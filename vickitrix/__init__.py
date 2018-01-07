@@ -10,6 +10,15 @@ rules/vicki.py and follow the tweets of @vickicryptobot.
 from __future__ import print_function
 
 import sys
+import os
+import errno
+import time
+import argparse
+import getpass
+import base64
+import json
+
+from _collections import defaultdict
 
 # For 2-3 compatibility
 try:
@@ -29,7 +38,7 @@ except ImportError as e:
     raise
 
 try:
-    from twython import TwythonStreamer, Twython, TwythonError
+    from twython import  Twython, TwythonError
 except ImportError as e:
     e.message = (
             'vickitrix requires Twython. Install it with '
@@ -48,61 +57,22 @@ except ImportError as e:
     )
     raise
 
-import os
-import errno
-import time
-import argparse
-import getpass
-import datetime
-import base64
-import json
+
 # In case user wants to use regular expressions on conditions/funds
 import re
+import logging
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO)
+log = logging.getLogger(__name__)
+log.setLevel(logging.DEBUG)
+
 
 def help_formatter(prog):
     """ So formatter_class's max_help_position can be changed. """
     return argparse.HelpFormatter(prog, max_help_position=40)
 
-def print_to_screen(message, newline=True, carriage_return=False):
-    """ Prints message to stdout as well as stderr if stderr is redirected.
-
-        message: message to print
-        newline: True iff newline should be printed
-        carriage_return: True iff carriage return should be printed; also
-            clears line with ANSI escape code
-
-        No return value.
-    """
-    full_message = ('\x1b[K' + message + ('\r' if carriage_return else '')
-                        + (os.linesep if newline else ''))
-    try:
-        sys.stderr.write(full_message)
-        if sys.stderr.isatty():
-            sys.stderr.flush()
-        else:
-            try:
-                # So the user sees it too
-                sys.stdout.write(full_message)
-                sys.stdout.flush()
-            except UnicodeEncodeError:
-                sys.stdout.write(
-                                unicodedata.normalize(
-                                        'NFKD', full_message
-                                    ).encode('ascii', 'ignore')
-                            )
-                sys.stdout.flush()
-    except UnicodeEncodeError:
-        sys.stderr.write(
-                        unicodedata.normalize(
-                                'NFKD', full_message
-                            ).encode('ascii', 'ignore')
-                    )
-        sys.stderr.flush()
-
-def timestamp():
-    """ Returns timestamp string. """
-    return time.strftime('%A, %b %d, %Y at %I:%M:%S %p %Z || ',
-                         time.localtime(time.time()))
 
 def prettify_dict(rule):
     """ Prettifies printout of dictionary as string.
@@ -114,7 +84,8 @@ def prettify_dict(rule):
     return json.dumps(rule, sort_keys=False,
                         indent=4, separators=(',', ': '))
 
-def get_dough(gdax_client, status_update=False):
+
+def get_balance(gdax_client, status_update=False):
     """ Retrieve dough in user accounts
 
         gdax_client: instance of gdax.AuthenticatedClient
@@ -126,110 +97,194 @@ def get_dough(gdax_client, status_update=False):
     for account in gdax_client.get_accounts():
         dough[account['currency']] = account['available']
     if status_update:
-        print_to_screen(''.join([timestamp(), 'Available to trade: ',
-                        ', '.join(map(' '.join,
-                                        [el[::-1] for el in dough.items()]))]))
+        balance_str = ', '.join('%s: %s' % (p, a) for p, a in dough.items())
+        log.info('Current balance in wallet: %s' % balance_str)
     return dough
 
-class TradeListener(TwythonStreamer):
+
+def relevant_tweet(tweet, rule, available):
+    import pdb; pdb.set_trace();
+    if (
+        # Check if this is a user we are following
+        ((not rule['handles']) or
+         ('user' in tweet and tweet['user']['screen_name'].lower() in rule['handles']))
+
+        and
+
+        # Check if the tweet text matches any defined condition
+        ((not rule['keywords']) or
+         any([keyword in tweet['text'].lower() for keyword in rule['keywords']]))
+
+        and
+
+        eval(rule['condition'].format(tweet='tweet["text"]',available=available))):
+
+        # Check if this is an RT or reply
+        if (('retweeted_status' in tweet and tweet['retweeted_status']) or
+                tweet['in_reply_to_status_id'] or
+                tweet['in_reply_to_status_id_str'] or
+                tweet['in_reply_to_user_id'] or
+                tweet['in_reply_to_user_id_str'] or
+                tweet['in_reply_to_screen_name']):
+
+            return False
+
+        return True
+
+    return False
+
+
+def twitter_handles_to_userids(twitter, handles):
+    ids_map = {}
+
+    for handle in handles:
+        try:
+            ids_map[handle] = twitter.show_user(screen_name=handle)['id_str']
+        except TwythonError as e:
+            if 'User not found' in e.message:
+                log.warning('Handle %s not found; skipping rule...' % handle)
+            else:
+                raise
+
+    if not ids_map:
+        raise RuntimeError('No followable Twitter handles found in rules!')
+
+    return ids_map
+
+
+class State:
+    def __init__(self, path):
+        self.path = path
+        self.d = self._load()
+
+    def _load(self):
+        try:
+            with open(self.path, 'r') as fp:
+                return json.load(fp)
+        except (ValueError, IOError, TypeError):
+            log.warning("Could not load state from '%s'. Creating new..." %
+                        self.path)
+            return {}
+
+    def save(self):
+        with open(self.path, 'w', encoding='ascii') as fp:
+            json.dump(self.d, fp)
+
+
+class TradingStateMachine:
     """ Trades on GDAX based on tweets. """
 
-    def __init__(self, rules, gdax_client,
-                 app_key, app_secret, oauth_token, oauth_token_secret,
-                 timeout=300, retry_count=None, retry_in=10, client_args=None,
-                 handlers=None, chunk_size=1, sleep_time=0.5):
-        super(TradeListener, self).__init__(
-                app_key, app_secret, oauth_token, oauth_token_secret,
-                timeout=300, retry_count=None, retry_in=10, client_args=None,
-                handlers=None, chunk_size=1
-            )
+    def __init__(self, rules, gdax_client, twitter_client, handles, state,
+                 sleep_time=0.5):
         self.rules = rules
-        self.gdax_client = gdax_client
+        self.gdax = gdax_client
+        self.twitter = twitter_client
+        self.handles = handles
+        self.state_obj = state
+        self.state = state.d
         self.sleep_time = sleep_time
-        self.available = get_dough(self.gdax_client, status_update=False)
+        self.available = get_balance(self.gdax, status_update=False)
         self.public_client = gdax.PublicClient() # for product order book
 
-    def on_success(self, status):
-        for rule in self.rules:
-            if ((not rule['handles'])
-                 or ('user' in status
-                     and status['user']['screen_name'].lower()
-                 in rule['handles'])) and ((not rule['keywords'])
-                 or any([keyword in status['text'].lower()
-                            for keyword in rule['keywords']])) and eval(
-                        rule['condition'].format(
-                            tweet='status["text"]',
-                            available=self.available
-                    )):
-                if (('retweeted_status' in status 
-                     and status['retweeted_status'])
-                     or status['in_reply_to_status_id']
-                     or status['in_reply_to_status_id_str']
-                     or status['in_reply_to_user_id']
-                     or status['in_reply_to_user_id_str']
-                     or status['in_reply_to_screen_name']):
-                    # This is an RT or reply; don't do anything
-                    return
-                # Condition satisfied! Perform action
-                print_to_screen(
-                        ''.join(
-                            [timestamp(), 'TWEET MATCHED || @',
-                             status['user']['screen_name'] , ': ',
-                             status['text']]
-                        )
-                    )
-                for order in rule['orders']:
-                    self.available = get_dough(self.gdax_client,
-                                                    status_update=True)
-                    order_book = self.public_client.get_product_order_book(
-                            order['product_id']
-                        )
-                    inside_bid, inside_ask = (
-                            order_book['bids'][0][0],
-                            order_book['asks'][0][0]
-                        )
-                    not_enough = False
-                    for money in ['size', 'funds', 'price']:
-                        try:
-                            '''If the hundredths rounds down to zero,
-                            ain't enough'''
-                            order[money] = str(eval(
-                                    order[money].format(
-                                            tweet='status.text',
-                                            available=self.available,
-                                            inside_bid=inside_bid,
-                                            inside_ask=inside_ask
-                                        )
-                                ))
-                            not_enough = (
-                                    int(float(order[money]) * 100) == 0
-                                )
-                        except KeyError:
-                            pass
-                    print_to_screen(''.join(
-                                [timestamp(), 'PLACING ORDER', os.linesep] +
-                                [prettify_dict(order)]
-                            ))
-                    if not_enough:
-                        print_to_screen(
-                                timestamp() +
-                                'One of {"price", "funds", "size"} is zero! ' +
-                                'Order not placed.'
-                            )
-                        return
-                    if order['side'] == 'buy':
-                        self.gdax_client.buy(**order)
-                    else:
-                        assert order['side'] == 'sell'
-                        self.gdax_client.sell(**order)
-                    print_to_screen(timestamp() + 'Order placed.')
-                    time.sleep(self.sleep_time)
-                get_dough(self.gdax_client, status_update=True)
+    def _run(self):
+        ids_map = twitter_handles_to_userids(self.twitter, self.handles)
+        tweets = []
 
-    def on_error(self, status_code, status):
-        if status_code == 420:
-            # Rate limit error; bail and wait to reconnect
-            self.disconnect()
+        for handle, uid in ids_map.items():
+            try:
+                tweet_cursor = self.state['twitter'][handle]['cursor']
+            except KeyError:
+                tweet_cursor = None
+
+            t = self.twitter.get_user_timeline(
+                user_id=uid, count=1, exclude_replies=True)
+
+            if len(t) > 1:
+                log.error("Retrieved timeline with multiple tweets: %s", t)
+
+            cursor = t[0]['user']['id_str']
+            try:
+                self.state['twitter'][handle]['cursor'] = cursor
+            except KeyError:
+                if 'twitter' not in self.state:
+                    self.state['twitter'] = {}
+                if handle not in self.state['twitter']:
+                    self.state['twitter'][handle] = {}
+
+                self.state['twitter'][handle]['cursor'] = cursor
+
+            tweets.append(t[0])
+
+        for tweet in tweets:
+            self._trade(tweet)
+
+    def _add_orders(self, tweet, rule):
+        # Condition satisfied! Perform action
+        log.info("Tweet match || @ %s: %s" %
+                 (tweet['user']['screen_name'], tweet['text']))
+
+        for order in rule['orders']:
+            self.available = get_balance(self.gdax, status_update=True)
+            order_book = \
+                self.public_client.get_product_order_book(order['product_id'])
+
+            inside_bid = order_book['bids'][0][0]
+            inside_ask = order_book['asks'][0][0]
+            not_enough = False
+
+            for money in ['size', 'funds', 'price']:
+                try:
+                    '''If the hundredths rounds down to zero,
+                    ain't enough'''
+                    order[money] = str(eval(
+                        order[money].format(
+                            tweet='tweet.text',
+                            available=self.available,
+                            inside_bid=inside_bid,
+                            inside_ask=inside_ask
+                        )
+                    ))
+                    not_enough = (
+                            int(float(order[money]) * 100) == 0
+                    )
+                except KeyError:
+                    pass
+
+            log.info('Placing order: %s' % prettify_dict(order))
+
+            if not_enough:
+                log.warning(
+                    'One of {"price", "funds", "size"} is zero! '
+                    'Order not placed.')
+                return
+
+            if order['side'] == 'buy':
+                self.gdax.buy(**order)
+            else:
+                assert order['side'] == 'sell'
+                self.gdax.sell(**order)
+
+            log.info('Order placed.')
+            time.sleep(self.sleep_time)
+
+    def _trade(self, tweet):
+        log.debug("Received the following tweet: %s" % tweet)
+
+        for rule in self.rules:
+            if not relevant_tweet(tweet, rule, self.available):
+                log.warning("Got irrelevant tweet: %s", tweet['text'])
+                continue
+
+            self._add_orders(tweet, rule)
+
+        get_balance(self.gdax, status_update=True)
+
+
+    def run(self):
+        while True:
+            self._run()
+            time.sleep(60)
+
 
 def go():
     """ Entry point """
@@ -386,10 +441,12 @@ def go():
         import copy
         # Add missing keys so listener doesn't fail
         new_rules = copy.copy(rules)
-        order_vocab = set(['client_oid', 'type', 'side', 'product_id', 'stp',
-                           'price', 'size', 'time_in_force', 'cancel_after',
-                           'post_only', 'funds', 'overdraft_enabled',
-                           'funding_amount'])
+        order_vocab = frozenset([
+            'client_oid', 'type', 'side', 'product_id', 'stp',
+            'price', 'size', 'time_in_force', 'cancel_after',
+            'post_only', 'funds', 'overdraft_enabled', 'funding_amount',
+        ])
+
         for i, rule in enumerate(rules):
             # Check 'condition'
             try:
@@ -414,7 +471,8 @@ def go():
                         os.linesep, prettify_dict(rule)
                     ])
                 )
-            # Check handles or keywords
+
+            # Check handles and keywords
             if 'handles' not in rule and 'keywords' not in rule:
                 raise RuntimeError(''.join([
                         ('A rule must have at least one of {{"handles", '
@@ -462,9 +520,7 @@ def go():
                         os.linesep, prettify_dict(rule)
                     ]))
                 try:
-                    if order['type'] not in [
-                            'limit', 'market', 'stop'
-                        ]:
+                    if order['type'] not in ('limit', 'market', 'stop'):
                         raise RuntimeError(''.join([
                             ('An order\'s "type" must be one of {{"limit", '
                              '"market", "stop"}}, which order #{} in this '
@@ -588,22 +644,28 @@ def go():
                     'before trading.'
                 )
             raise
+
+        # Get all twitter handles to monitor
+        handles, keywords = set(), set()
+        for rule in rules:
+            handles.update(rule['handles'])
+            keywords.update(rule['keywords'])
+
         try:
             # Instantiate GDAX and Twitter clients
-            gdax_client = gdax.AuthenticatedClient(
-                                    *keys_and_secrets[:3]
-                                )
-            # Are they working?
-            get_dough(gdax_client, status_update=True)
+            gdax_client = gdax.AuthenticatedClient(*keys_and_secrets[:3])
             twitter_client = Twython(*keys_and_secrets[3:7])
-            trade_listener = TradeListener(
-                    *([rules, gdax_client] + keys_and_secrets[3:7]),
-                    sleep_time=args.sleep
-                )
-        except Exception as e:
+
+            # Are they working?
+            get_balance(gdax_client, status_update=True)
+            state = State('state.dat')
+            trader = TradingStateMachine(rules, gdax_client, twitter_client,
+                                         handles, state, sleep_time=args.sleep)
+
+        except Exception:
             from traceback import format_exc
-            print_to_screen(format_exc())
-            print_to_screen(''.join(
+            log.error(format_exc())
+            log.error(''.join(
                     [os.linesep,
                      'Chances are, this opaque error happened because either ',
                       os.linesep,
@@ -613,37 +675,11 @@ def go():
                       'b) You entered the wrong password above.']
                 ))
             exit(1)
-        print_to_screen('Twitter/GDAX credentials verified.')
-        # Get all handles to monitor
-        handles, keywords = set(), set()
-        for rule in rules:
-            handles.update(rule['handles'])
-            keywords.update(rule['keywords'])
-        handles_to_user_ids = {}
-        for handle in handles:
-            try:
-                handles_to_user_ids[handle] = twitter_client.show_user(
-                                                            screen_name=handle
-                                                        )['id_str']
-            except TwythonError as e:
-                if 'User not found' in e.message:
-                    print(
-                        'Handle {} not found; skipping rule...'.format(handle)
-                    )
-                else:
-                    raise
-        if not handles_to_user_ids:
-            raise RuntimeError('No followable Twitter handles found in rules!')
+
+        log.info('Twitter/GDAX credentials verified.')
+
         while True:
-            print_to_screen('Listening for tweets; hit CTRL+C to quit...')
-            trade_listener.statuses.filter(
-                    follow=handles_to_user_ids.values(),
-                    track=list(keywords)
-                )
-            print_to_screen(
-                    timestamp()
-                    + 'Rate limit error. Restarting in {} s...'.format(
-                                                                args.interval
-                                                            )
-                )
+            log.info('Waiting for trades; hit CTRL+C to quit...')
+            trader.run()
+            log.info('Rate limit error. Restarting in %d s...' % args.interval)
             time.sleep(args.interval)
