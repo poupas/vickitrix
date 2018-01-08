@@ -432,7 +432,7 @@ class TradingStateMachine:
         while True:
             self._run()
             log.debug("Sleeping...")
-            time.sleep(10)
+            time.sleep(120)
 
 
 def go():
