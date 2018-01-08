@@ -12,13 +12,13 @@ setup(name='vickitrix',
       package_data={'vickitrix': ['*.py', './rules/*']},
       zip_safe=True,
       install_requires=[
-      		'twython', 'gdax', 'pycrypto'
+      		'twython', 'gdax', 'pycrypto', 'python-dateutil'
       	],
       entry_points={
         'console_scripts': [
             'vickitrix=vickitrix:go',
         ],},
-      keywords=['bitcoin', 'btc', 'ethereum', 'eth', 'twitter', 'python-dateutil'],
+      keywords=['bitcoin', 'btc', 'ethereum', 'eth', 'twitter'],
       classifiers=[
           'Programming Language :: Python :: 2',
           'Programming Language :: Python :: 3',
