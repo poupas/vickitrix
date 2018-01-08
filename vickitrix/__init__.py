@@ -18,8 +18,6 @@ import getpass
 import base64
 import json
 
-from _collections import defaultdict
-
 # For 2-3 compatibility
 try:
     input = raw_input
@@ -57,6 +55,14 @@ except ImportError as e:
     )
     raise
 
+try:
+    import dateutil.parser
+except ImportError as e:
+    e.message = (
+        'vickitrix requires dateutil. Install it with '
+        '"pip install python-dateutil".'
+    )
+    raise
 
 # In case user wants to use regular expressions on conditions/funds
 import re
@@ -166,9 +172,10 @@ class State:
             return {
                 'twitter': {
                     'pairs': {},
+                    'handles': {},
                 },
                 'gdax': {
-                    'pairs': {},
+                    'orders': {},
                 },
             }
 
@@ -177,23 +184,28 @@ class State:
             json.dump(self.d, fp)
 
 
-def new_order(rule, order, tweet):
+def new_order(rule, gdax_order, tweet):
     ttl_s = int(rule.get('ttl_seconds', 60))
     retries = int(rule.get('retries', 1))
-    now = int(time.time())
+    created = int(dateutil.parser.parse(tweet['created_at']).strftime('%s'))
+    market_fallback = rule.get('market_fallback', False)
+    expiration = created + ttl_s * retries
+    if market_fallback:
+        expiration += ttl_s
+
     return {
-        'gdax_order': order,
-        'pair': order['product_id'],
-        'side': order['side'],
-        'handle': tweet['user']['screen_name'].lower(),
+        'gdax_order': gdax_order,
+        'handle': tweet['user']['screen_name'],
+        'pair': gdax_order['product_id'],
+        'side': gdax_order['side'],
         'id': tweet['id_str'],
         'tries_left': retries,
-        'market_fallback': rule.get('market_fallback', False),
+        'market_fallback': market_fallback,
         'status': 'new',
         'gdax_id': None,
         'ttl_s': ttl_s,
-        'try_expires': None,
-        'expires': now + ttl_s * retries
+        'try_expiration': None,
+        'expiration':expiration,
     }
 
 
@@ -218,62 +230,61 @@ class TradingStateMachine:
         ids_map = twitter_handles_to_userids(self.twitter, self.handles)
         tweets = []
 
-        # Refresh Twitter status
+        # Refresh Twitter bot positions
         for handle, uid in ids_map.items():
             try:
-                latest_tweet = twitter_state[handle]['id']
+                latest_tweet = twitter_state['handles'][handle]['id']
             except KeyError:
                 latest_tweet = None
 
             tweets += self.twitter.get_user_timeline(
                 user_id=uid, exclude_replies=True, since_id=latest_tweet)
 
-        orders = {}
+        # Prepare buy/sell orders
+        orders = gdax_state['orders']
         for tweet in tweets:
             self._paper_trade(tweet, orders)
+            self._update_twitter_state(
+                tweet['user']['screen_name'],
+                tweet['id_str'])
 
-        for o in orders.values():
-            # Update Twitter state
-            self._update_state(
-                twitter_state, o['handle'], o['id'], o['pair'], o['side'])
-
-            # Make sure that GDAX state is initialized
-            self._update_state(
-                gdax_state, o['handle'], o['id'], o['pair'], None, order=o)
-
-        # Check if there is any order pending.
-        for pair in gdax_state['pairs'].values():
-            order = pair['order']
+        # Act on orders
+        for order in orders.values():
+            self._update_gdax_state(order)
+            self._update_twitter_state(
+                order['handle'],
+                order['id'],
+                order['pair'],
+                order['side'])
 
             if order['status'] in ('settled', 'expired'):
                 continue
 
-            # Check if the pending order is still valid
             now = int(time.time())
+            if now > order['expiration']:
+                log.warning("Order %s is expired. Ignoring...", order)
+                order['status'] = 'expired'
+                continue
+
             if order['status'] == 'pending':
                 r = self.gdax.get_order(order['gdax_id'])
                 if r.get('status') in ('done', 'settled'):
                     order['status'] = 'settled'
                     log.info("Order completed!: %s", order)
                     continue
-                elif now < order['try_expires']:
+                elif now < order['try_expiration']:
                     log.debug("Pending order is still valid: %s", order)
                     continue
 
-            if order['tries_left'] > 0 and now < order['expires']:
+            if order['tries_left'] > 0:
                 order['tries_left'] -= 1
-                order['try_expires'] = now + order['ttl_s']
-                o = self._add_order(order)
-                pair['side'] = o['side']
-            else:
-                fallback = order['market_fallback']
-                if fallback and order['gdax_order']['type'] == 'limit':
-                    order['gdax_order']['type'] = 'market'
-                    order['tries_left'] = 1
-                    order['try_expires'] = now + order['ttl_s']
-                    order['expires'] = order['try_expires']
-                else:
-                    order['status'] = 'expired'
+                order['try_expiration'] = now + order['ttl_s']
+                self._add_order(order)
+            elif (order['market_fallback'] and
+                  order['gdax_order']['type'] == 'limit'):
+                order['gdax_order']['type'] = 'market'
+                order['tries_left'] = 1
+                order['try_expiration'] = now + order['ttl_s']
 
         self.state_obj.save()
 
@@ -289,39 +300,51 @@ class TradingStateMachine:
         log.info("Found an order waiting: %s", r)
         return r['status'] != 'settled'
 
-    def _update_state(self, state, handle, new_id, pair, side, order=None):
+    def _update_gdax_state(self, new_order):
+        state = self.state['gdax']
+        pair = new_order['pair']
         try:
-            handle_id = state[handle]['id']
-            pair_id = state['pairs'][pair]['id']
+            order = state['orders'][pair]
+        except KeyError:
+            state['orders'][pair] = new_order
+        else:
+            if new_order['id'] > order['id']:
+                state['orders'][pair] = new_order
+            else:
+                log.debug("Ignoring order %s with id (older than %s)",
+                          new_order['id'], order['id'])
+
+    def _update_twitter_state(self, handle, new_id, pair=None, side=None):
+        handle = handle.lower()
+        state = self.state['twitter']
+        try:
+            handle_id = state['handles'][handle]['id']
+            if pair:
+                pair_id = state['pairs'][pair]['id']
         except KeyError:
             if handle not in state:
-                state[handle] = {
+                state['handles'][handle] = {
                     'id': new_id
                 }
-
-            if pair not in state['pairs']:
+            if pair and pair not in state['pairs']:
                 state['pairs'][pair] = {
                     'side': side,
                     'id': new_id
                 }
-                if order is not None:
-                    state['pairs'][pair]['order'] = order
-
-            handle_id = state[handle]['id']
-            pair_id = state['pairs'][pair]['id']
+            handle_id = state['handles'][handle]['id']
+            if pair:
+                pair_id = state['pairs'][pair]['id']
 
         if int(new_id) > int(handle_id):
-            state[handle]['id'] = new_id
-
-        if int(new_id) > int(pair_id):
+            state['handles'][handle]['id'] = new_id
+        if pair and int(new_id) > int(pair_id):
             state['pairs'][pair]['id'] = new_id
             state['pairs'][pair]['side'] = side
-            state['pairs'][pair]['order'] = order
 
     def _get_orders(self, tweet, rule):
         orders = []
-        for order in rule['orders']:
-            orders.append(new_order(rule, order, tweet))
+        for gdax_order in rule['orders']:
+            orders.append(new_order(rule, gdax_order, tweet))
         return orders
 
     def _add_order(self, order):
@@ -409,7 +432,7 @@ class TradingStateMachine:
         while True:
             self._run()
             log.debug("Sleeping...")
-            time.sleep(120)
+            time.sleep(10)
 
 
 def go():

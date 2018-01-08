@@ -18,7 +18,7 @@ setup(name='vickitrix',
         'console_scripts': [
             'vickitrix=vickitrix:go',
         ],},
-      keywords=['bitcoin', 'btc', 'ethereum', 'eth', 'twitter'],
+      keywords=['bitcoin', 'btc', 'ethereum', 'eth', 'twitter', 'python-dateutil'],
       classifiers=[
           'Programming Language :: Python :: 2',
           'Programming Language :: Python :: 3',
