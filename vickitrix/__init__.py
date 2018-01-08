@@ -92,7 +92,7 @@ def prettify_dict(rule):
 
 
 def get_balance(gdax_client, status_update=False):
-    """ Retrieve dough in user accounts
+    """ Retrieve balance in user accounts
 
         gdax_client: instance of gdax.AuthenticatedClient
         status_update: True iff status update should be printed
@@ -185,13 +185,10 @@ class State:
 
 
 def new_order(rule, gdax_order, tweet):
-    ttl_s = int(rule.get('ttl_seconds', 60))
-    retries = int(rule.get('retries', 1))
+    retries = int(rule.get('retries', 3))
     created = int(dateutil.parser.parse(tweet['created_at']).strftime('%s'))
-    market_fallback = rule.get('market_fallback', False)
-    expiration = created + ttl_s * retries
-    if market_fallback:
-        expiration += ttl_s
+    retry_ttl = int(rule.get('retry_ttl_s', 200))
+    tweet_ttl = int(rule.get('tweet_ttl_s', 3600))
 
     return {
         'gdax_order': gdax_order,
@@ -200,12 +197,12 @@ def new_order(rule, gdax_order, tweet):
         'side': gdax_order['side'],
         'id': tweet['id_str'],
         'tries_left': retries,
-        'market_fallback': market_fallback,
+        'market_fallback': rule.get('market_fallback', False),
         'status': 'new',
         'gdax_id': None,
-        'ttl_s': ttl_s,
-        'try_expiration': None,
-        'expiration':expiration,
+        'retry_ttl': retry_ttl,
+        'retry_expiration': 0,
+        'expiration': created + tweet_ttl,
     }
 
 
@@ -257,12 +254,13 @@ class TradingStateMachine:
                 order['pair'],
                 order['side'])
 
+            now = int(time.time())
+
             if order['status'] in ('settled', 'expired'):
                 continue
 
-            now = int(time.time())
-            if now > order['expiration']:
-                log.warning("Order %s is expired. Ignoring...", order)
+            if order['status'] == 'new' and now > order['expiration']:
+                log.warning("Order has expired. Ignoring: %s", order)
                 order['status'] = 'expired'
                 continue
 
@@ -272,19 +270,22 @@ class TradingStateMachine:
                     order['status'] = 'settled'
                     log.info("Order completed!: %s", order)
                     continue
-                elif now < order['try_expiration']:
+                elif now < order['retry_expiration']:
                     log.debug("Pending order is still valid: %s", order)
                     continue
 
             if order['tries_left'] > 0:
                 order['tries_left'] -= 1
-                order['try_expiration'] = now + order['ttl_s']
-                self._add_order(order)
+                order['retry_expiration'] = now + order['retry_ttl']
+                order = self._add_order(order)
             elif (order['market_fallback'] and
                   order['gdax_order']['type'] == 'limit'):
                 order['gdax_order']['type'] = 'market'
                 order['tries_left'] = 1
-                order['try_expiration'] = now + order['ttl_s']
+                order['retry_expiration'] = now + order['retry_ttl']
+            else:
+                log.warning("Order is expired: %s", order)
+                order['status'] = 'expired'
 
         self.state_obj.save()
 
@@ -311,7 +312,7 @@ class TradingStateMachine:
             if new_order['id'] > order['id']:
                 state['orders'][pair] = new_order
             else:
-                log.debug("Ignoring order %s with id (older than %s)",
+                log.debug("Order already up-to-date (%s <= %s)",
                           new_order['id'], order['id'])
 
     def _update_twitter_state(self, handle, new_id, pair=None, side=None):
@@ -418,15 +419,31 @@ class TradingStateMachine:
                      (tweet['user']['screen_name'], tweet['text']))
 
             new_orders = self._get_orders(tweet, rule)
-            for o in new_orders:
-                if (o['pair'] not in orders or
-                        int(o['id']) > int(orders[o['pair']]['id'])):
+            for nwo in new_orders:
+                pair = nwo['pair']
+                order = orders.get(pair)
+                if order is None:
                     log.info("Adding order [%s] to pending orders list...",
-                             o['gdax_order'])
-                    orders[o['pair']] = o
+                             nwo['gdax_order'])
+                    orders[pair] = nwo
+                    continue
+
+                # The new order must be more recent than the existing one.
+                if int(nwo['id']) <= int(order['id']):
+                    log.warning("Order already up-to-date. (%s >= %s)",
+                                nwo['id'], order['id'])
+                    continue
+
+                order_settled = order['status'] == 'settled'
+                if nwo['side'] == order['side'] and order_settled:
+                    log.warning(
+                        "New order side matches old order. "
+                        "Updating state without further actions. "
+                        "Details: Existing order: %s, new order: %s",
+                        order['gdax_order'], nwo['gdax_order'])
+                    order['id'] = new_order['id']
                 else:
-                    log.warning("Ignoring order [%s]; newer order exists.",
-                                o['gdax_order'])
+                    orders[pair] = nwo
 
     def run(self):
         while True:
