@@ -178,19 +178,22 @@ class State:
 
 
 def new_order(rule, order, tweet):
-    ttl_minutes = int(rule['ttl_minutes']) if 'ttl_minutes' in rule else 60
-    retries = int(rule['retries']) if 'retries' in rule else 1
+    ttl_s = int(rule.get('ttl_seconds', 60))
+    retries = int(rule.get('retries', 1))
+    now = int(time.time())
     return {
         'gdax_order': order,
         'pair': order['product_id'],
         'side': order['side'],
-        'handle': tweet['user']['screen_name'],
+        'handle': tweet['user']['screen_name'].lower(),
         'id': tweet['id_str'],
         'tries_left': retries,
-        'market_fallback': False,
+        'market_fallback': rule.get('market_fallback', False),
         'status': 'new',
         'gdax_id': None,
-        'expiration': int(time.time()) + ttl_minutes * retries * 60
+        'ttl_s': ttl_s,
+        'try_expires': None,
+        'expires': now + ttl_s * retries
     }
 
 
@@ -235,29 +238,42 @@ class TradingStateMachine:
                 twitter_state, o['handle'], o['id'], o['pair'], o['side'])
 
             # Make sure that GDAX state is initialized
-            self._update_state(gdax_state, o['handle'], 0, o['pair'], None, order=o)
+            self._update_state(
+                gdax_state, o['handle'], o['id'], o['pair'], None, order=o)
 
         # Check if there is any order pending.
         for pair in gdax_state['pairs'].values():
             order = pair['order']
 
-            if order['status'] == 'settled':
+            if order['status'] in ('settled', 'expired'):
                 continue
 
             # Check if the pending order is still valid
-            if self._order_waiting(order):
-                continue
-
             now = int(time.time())
-            if order['tries_left'] > 0 and now < order['expiration']:
-                order['tries_left'] -= 1
-                o = self._add_order(o)
-                pair['side'] = o['side']
-                if o['status'] == 'settled':
-                    o = None
+            if order['status'] == 'pending':
+                r = self.gdax.get_order(order['gdax_id'])
+                if r.get('status') in ('done', 'settled'):
+                    order['status'] = 'settled'
+                    log.info("Order completed!: %s", order)
+                    continue
+                elif now < order['try_expires']:
+                    log.debug("Pending order is still valid: %s", order)
+                    continue
 
-                self._update_state(
-                    gdax_state, o['handle'], o['id'], o['pair'], o['side'], order=o)
+            if order['tries_left'] > 0 and now < order['expires']:
+                order['tries_left'] -= 1
+                order['try_expires'] = now + order['ttl_s']
+                o = self._add_order(order)
+                pair['side'] = o['side']
+            else:
+                fallback = order['market_fallback']
+                if fallback and order['gdax_order']['type'] == 'limit':
+                    order['gdax_order']['type'] = 'market'
+                    order['tries_left'] = 1
+                    order['try_expires'] = now + order['ttl_s']
+                    order['expires'] = order['try_expires']
+                else:
+                    order['status'] = 'expired'
 
         self.state_obj.save()
 
@@ -270,6 +286,7 @@ class TradingStateMachine:
         if 'id' not in r:
             return False
 
+        log.info("Found an order waiting: %s", r)
         return r['status'] != 'settled'
 
     def _update_state(self, state, handle, new_id, pair, side, order=None):
@@ -308,8 +325,6 @@ class TradingStateMachine:
         return orders
 
     def _add_order(self, order):
-        import pdb; pdb.set_trace()
-
         gdax_order = order['gdax_order']
         # Ensure that there is no pending order for this pair.
         if order['status'] == 'pending':
@@ -394,7 +409,7 @@ class TradingStateMachine:
         while True:
             self._run()
             log.debug("Sleeping...")
-            time.sleep(5)
+            time.sleep(120)
 
 
 def go():
