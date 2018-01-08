@@ -269,8 +269,9 @@ class TradingStateMachine:
                 log.debug("Fetched order %s status: %s", order['gdax_id'], r)
 
                 if r.get('status') in ('done', 'settled'):
+                    order['status'] = r.get('status')
                     log.info("Order completed!: %s", order)
-                    order['status'] = 'settled'
+                    self.available = get_balance(self.gdax, status_update=True)
                     continue
                 elif now < order['retry_expiration']:
                     log.debug("Pending order is still valid: %s", order)
@@ -313,9 +314,6 @@ class TradingStateMachine:
         else:
             if new_order['id'] > order['id']:
                 state['orders'][pair] = new_order
-            else:
-                log.debug("Order already up-to-date (%s <= %s)",
-                          new_order['id'], order['id'])
 
     def _update_twitter_state(self, handle, new_id, pair=None, side=None):
         handle = handle.lower()
