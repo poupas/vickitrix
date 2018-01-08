@@ -93,17 +93,16 @@ def get_balance(gdax_client, status_update=False):
 
         Return value: dictionary mapping currency to account information
     """
-    dough = {}
+    balance = {}
     for account in gdax_client.get_accounts():
-        dough[account['currency']] = account['available']
+        balance[account['currency']] = account['available']
     if status_update:
-        balance_str = ', '.join('%s: %s' % (p, a) for p, a in dough.items())
+        balance_str = ', '.join('%s: %s' % (p, a) for p, a in balance.items())
         log.info('Current balance in wallet: %s' % balance_str)
-    return dough
+    return balance
 
 
-def relevant_tweet(tweet, rule, available):
-    import pdb; pdb.set_trace();
+def relevant_tweet(tweet, rule, balance):
     if (
         # Check if this is a user we are following
         ((not rule['handles']) or
@@ -117,7 +116,7 @@ def relevant_tweet(tweet, rule, available):
 
         and
 
-        eval(rule['condition'].format(tweet='tweet["text"]',available=available))):
+        eval(rule['condition'].format(tweet='tweet["text"]',available=balance))):
 
         # Check if this is an RT or reply
         if (('retweeted_status' in tweet and tweet['retweeted_status']) or
@@ -164,11 +163,35 @@ class State:
         except (ValueError, IOError, TypeError):
             log.warning("Could not load state from '%s'. Creating new..." %
                         self.path)
-            return {}
+            return {
+                'twitter': {
+                    'pairs': {},
+                },
+                'gdax': {
+                    'pairs': {},
+                },
+            }
 
     def save(self):
         with open(self.path, 'w', encoding='ascii') as fp:
             json.dump(self.d, fp)
+
+
+def new_order(rule, order, tweet):
+    ttl_minutes = int(rule['ttl_minutes']) if 'ttl_minutes' in rule else 60
+    retries = int(rule['retries']) if 'retries' in rule else 1
+    return {
+        'gdax_order': order,
+        'pair': order['product_id'],
+        'side': order['side'],
+        'handle': tweet['user']['screen_name'],
+        'id': tweet['id_str'],
+        'tries_left': retries,
+        'market_fallback': False,
+        'status': 'new',
+        'gdax_id': None,
+        'expiration': int(time.time()) + ttl_minutes * retries * 60
+    }
 
 
 class TradingStateMachine:
@@ -187,103 +210,191 @@ class TradingStateMachine:
         self.public_client = gdax.PublicClient() # for product order book
 
     def _run(self):
+        twitter_state = self.state['twitter']
+        gdax_state = self.state['gdax']
         ids_map = twitter_handles_to_userids(self.twitter, self.handles)
         tweets = []
 
+        # Refresh Twitter status
         for handle, uid in ids_map.items():
             try:
-                tweet_cursor = self.state['twitter'][handle]['cursor']
+                latest_tweet = twitter_state[handle]['id']
             except KeyError:
-                tweet_cursor = None
+                latest_tweet = None
 
-            t = self.twitter.get_user_timeline(
-                user_id=uid, count=1, exclude_replies=True)
+            tweets += self.twitter.get_user_timeline(
+                user_id=uid, exclude_replies=True, since_id=latest_tweet)
 
-            if len(t) > 1:
-                log.error("Retrieved timeline with multiple tweets: %s", t)
-
-            cursor = t[0]['user']['id_str']
-            try:
-                self.state['twitter'][handle]['cursor'] = cursor
-            except KeyError:
-                if 'twitter' not in self.state:
-                    self.state['twitter'] = {}
-                if handle not in self.state['twitter']:
-                    self.state['twitter'][handle] = {}
-
-                self.state['twitter'][handle]['cursor'] = cursor
-
-            tweets.append(t[0])
-
+        orders = {}
         for tweet in tweets:
-            self._trade(tweet)
+            self._paper_trade(tweet, orders)
 
-    def _add_orders(self, tweet, rule):
-        # Condition satisfied! Perform action
-        log.info("Tweet match || @ %s: %s" %
-                 (tweet['user']['screen_name'], tweet['text']))
+        for o in orders.values():
+            # Update Twitter state
+            self._update_state(
+                twitter_state, o['handle'], o['id'], o['pair'], o['side'])
 
+            # Make sure that GDAX state is initialized
+            self._update_state(gdax_state, o['handle'], 0, o['pair'], None, order=o)
+
+        # Check if there is any order pending.
+        for pair in gdax_state['pairs'].values():
+            order = pair['order']
+
+            if order['status'] == 'settled':
+                continue
+
+            # Check if the pending order is still valid
+            if self._order_waiting(order):
+                continue
+
+            now = int(time.time())
+            if order['tries_left'] > 0 and now < order['expiration']:
+                order['tries_left'] -= 1
+                o = self._add_order(o)
+                pair['side'] = o['side']
+                if o['status'] == 'settled':
+                    o = None
+
+                self._update_state(
+                    gdax_state, o['handle'], o['id'], o['pair'], o['side'], order=o)
+
+        self.state_obj.save()
+
+    def _order_waiting(self, order):
+        if order['status'] != 'pending':
+            return False
+
+        r = self.gdax.get_order(order['gdax_id'])
+        assert(r is not None)
+        if 'id' not in r:
+            return False
+
+        return r['status'] != 'settled'
+
+    def _update_state(self, state, handle, new_id, pair, side, order=None):
+        try:
+            handle_id = state[handle]['id']
+            pair_id = state['pairs'][pair]['id']
+        except KeyError:
+            if handle not in state:
+                state[handle] = {
+                    'id': new_id
+                }
+
+            if pair not in state['pairs']:
+                state['pairs'][pair] = {
+                    'side': side,
+                    'id': new_id
+                }
+                if order is not None:
+                    state['pairs'][pair]['order'] = order
+
+            handle_id = state[handle]['id']
+            pair_id = state['pairs'][pair]['id']
+
+        if int(new_id) > int(handle_id):
+            state[handle]['id'] = new_id
+
+        if int(new_id) > int(pair_id):
+            state['pairs'][pair]['id'] = new_id
+            state['pairs'][pair]['side'] = side
+            state['pairs'][pair]['order'] = order
+
+    def _get_orders(self, tweet, rule):
+        orders = []
         for order in rule['orders']:
-            self.available = get_balance(self.gdax, status_update=True)
-            order_book = \
-                self.public_client.get_product_order_book(order['product_id'])
+            orders.append(new_order(rule, order, tweet))
+        return orders
 
-            inside_bid = order_book['bids'][0][0]
-            inside_ask = order_book['asks'][0][0]
-            not_enough = False
+    def _add_order(self, order):
+        import pdb; pdb.set_trace()
 
-            for money in ['size', 'funds', 'price']:
-                try:
-                    '''If the hundredths rounds down to zero,
-                    ain't enough'''
-                    order[money] = str(eval(
-                        order[money].format(
-                            tweet='tweet.text',
-                            available=self.available,
-                            inside_bid=inside_bid,
-                            inside_ask=inside_ask
-                        )
-                    ))
-                    not_enough = (
-                            int(float(order[money]) * 100) == 0
+        gdax_order = order['gdax_order']
+        # Ensure that there is no pending order for this pair.
+        if order['status'] == 'pending':
+            reply = self.gdax.cancel_order(order['gdax_id'])
+            if reply is None or 'error' in reply:
+                log.error("Could not cancel order: %s", order['gdax_id'])
+                order['status'] = 'error'
+                return order
+
+        self.available = get_balance(self.gdax, status_update=True)
+        order_book = self.public_client.get_product_order_book(order['pair'])
+
+        inside_bid = order_book['bids'][0][0]
+        inside_ask = order_book['asks'][0][0]
+
+        not_enough = False
+        for money in ['size', 'funds', 'price']:
+            try:
+                '''If the hundredths rounds down to zero,
+                ain't enough'''
+                gdax_order[money] = str(eval(
+                    gdax_order[money].format(
+                        tweet='tweet.text',
+                        available=self.available,
+                        inside_bid=inside_bid,
+                        inside_ask=inside_ask
                     )
-                except KeyError:
-                    pass
+                ))
+                not_enough = int(float(gdax_order[money]) * 100) == 0
 
-            log.info('Placing order: %s' % prettify_dict(order))
+            except KeyError:
+                pass
 
-            if not_enough:
-                log.warning(
-                    'One of {"price", "funds", "size"} is zero! '
-                    'Order not placed.')
-                return
+        log.info('Placing order: %s' % prettify_dict(gdax_order))
+        if not_enough:
+            log.warning(
+                'One of {"price", "funds", "size"} is zero! '
+                'Order not placed.')
+            order['status'] = 'error'
+            return order
 
-            if order['side'] == 'buy':
-                self.gdax.buy(**order)
-            else:
-                assert order['side'] == 'sell'
-                self.gdax.sell(**order)
+        if order['side'] == 'buy':
+            r = self.gdax.buy(**gdax_order)
+        else:
+            assert order['side'] == 'sell'
+            r = self.gdax.sell(**gdax_order)
 
-            log.info('Order placed.')
-            time.sleep(self.sleep_time)
+        log.info('Order placed.')
+        time.sleep(self.sleep_time)
 
-    def _trade(self, tweet):
-        log.debug("Received the following tweet: %s" % tweet)
+        if 'id' in r:
+            order['gdax_id'] = r['id']
+            order['status'] = r['status']
+        else:
+            order['status'] = 'error'
+
+        return order
+
+    def _paper_trade(self, tweet, orders):
+        log.debug("Got the following tweet: %s" % tweet['text'])
 
         for rule in self.rules:
             if not relevant_tweet(tweet, rule, self.available):
-                log.warning("Got irrelevant tweet: %s", tweet['text'])
                 continue
 
-            self._add_orders(tweet, rule)
+            # Relevant tweet. Do something with it...
+            log.info("Tweet rule match || @ %s: %s" %
+                     (tweet['user']['screen_name'], tweet['text']))
 
-        get_balance(self.gdax, status_update=True)
-
+            new_orders = self._get_orders(tweet, rule)
+            for o in new_orders:
+                if (o['pair'] not in orders or
+                        int(o['id']) > int(orders[o['pair']]['id'])):
+                    log.info("Adding order [%s] to pending orders list...",
+                             o['gdax_order'])
+                    orders[o['pair']] = o
+                else:
+                    log.warning("Ignoring order [%s]; newer order exists.",
+                                o['gdax_order'])
 
     def run(self):
         while True:
             self._run()
-            time.sleep(60)
+            log.debug("Sleeping...")
+            time.sleep(5)
 
 
 def go():
