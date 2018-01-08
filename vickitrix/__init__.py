@@ -180,7 +180,7 @@ class State:
             }
 
     def save(self):
-        with open(self.path, 'w', encoding='ascii') as fp:
+        with open(self.path, 'w') as fp:
             json.dump(self.d, fp)
 
 
