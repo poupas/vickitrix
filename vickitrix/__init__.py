@@ -266,9 +266,11 @@ class TradingStateMachine:
 
             if order['status'] == 'pending':
                 r = self.gdax.get_order(order['gdax_id'])
+                log.debug("Fetched order %s status: %s", order['gdax_id'], r)
+
                 if r.get('status') in ('done', 'settled'):
-                    order['status'] = 'settled'
                     log.info("Order completed!: %s", order)
+                    order['status'] = 'settled'
                     continue
                 elif now < order['retry_expiration']:
                     log.debug("Pending order is still valid: %s", order)
@@ -396,7 +398,7 @@ class TradingStateMachine:
             assert order['side'] == 'sell'
             r = self.gdax.sell(**gdax_order)
 
-        log.info('Order placed.')
+        log.info('Order placed. Server reply: %s', r)
         time.sleep(self.sleep_time)
 
         if 'id' in r:
