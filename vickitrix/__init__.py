@@ -82,6 +82,8 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 log.setLevel(logging.DEBUG)
 
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+
 
 def help_formatter(prog):
     """ So formatter_class's max_help_position can be changed. """
@@ -254,9 +256,6 @@ class TradingStateMachine:
             except KeyError:
                 latest_tweet = None
 
-            log.debug("Fetching all tweets for handle %s (latest tweet id %s)",
-                      handle, latest_tweet)
-
             while True:
                 new_tweets = self.twitter.get_user_timeline(
                     user_id=uid, exclude_replies=True, since_id=latest_tweet,
@@ -290,7 +289,7 @@ class TradingStateMachine:
                 log.debug("Fetched order %s status: %s", ctxt['order_id'], r)
 
                 if r.get('status') in ('done', 'settled'):
-                    ctxt['status'] = r['status']
+                    ctxt['status'] = 'settled'
                     ctxt['position'] = \
                         'long' if ctxt['order']['side'] == 'buy' else 'short'
                     log.info("Order %s done: %s", ctxt['order_id'], r)
@@ -553,7 +552,6 @@ class TradingStateMachine:
     def run(self):
         while True:
             self._run()
-            log.debug("Sleeping...")
             time.sleep(120)
 
 
