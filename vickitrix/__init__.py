@@ -17,6 +17,14 @@ import argparse
 import getpass
 import base64
 import json
+import decimal
+
+from copy import deepcopy
+
+from decimal import Decimal as D
+
+decimal.getcontext().prec = 8
+decimal.getcontext().rounding = decimal.ROUND_DOWN
 
 # For 2-3 compatibility
 try:
@@ -101,7 +109,7 @@ def get_balance(gdax_client, status_update=False):
     """
     balance = {}
     for account in gdax_client.get_accounts():
-        balance[account['currency']] = account['available']
+        balance[account['currency']] = D(account['available'])
     if status_update:
         balance_str = ', '.join('%s: %s' % (p, a) for p, a in balance.items())
         log.info('Current balance in wallet: %s' % balance_str)
@@ -175,7 +183,7 @@ class State:
                     'handles': {},
                 },
                 'gdax': {
-                    'orders': {},
+                    'contexts': {},
                 },
             }
 
@@ -184,24 +192,26 @@ class State:
             json.dump(self.d, fp)
 
 
-def new_order(rule, gdax_order, tweet):
+def new_order_context(rule, order, tweet):
     retries = int(rule.get('retries', 3))
     created = int(dateutil.parser.parse(tweet['created_at']).strftime('%s'))
     retry_ttl = int(rule.get('retry_ttl_s', 200))
     tweet_ttl = int(rule.get('tweet_ttl_s', 3600))
 
     return {
-        'gdax_order': gdax_order,
+        'order': order,
+        'order_id': None,
+        'pair': order['product_id'],
+        'side': order['side'],
+
         'handle': tweet['user']['screen_name'],
-        'pair': gdax_order['product_id'],
-        'side': gdax_order['side'],
         'id': tweet['id_str'],
-        'tries_left': retries,
+        'tries_left': retries + 1,
         'market_fallback': rule.get('market_fallback', False),
         'status': 'new',
-        'gdax_id': None,
         'retry_ttl': retry_ttl,
         'retry_expiration': 0,
+        'tweet_date': tweet['created_at'],
         'expiration': created + tweet_ttl,
     }
 
@@ -237,83 +247,77 @@ class TradingStateMachine:
             tweets += self.twitter.get_user_timeline(
                 user_id=uid, exclude_replies=True, since_id=latest_tweet)
 
-        # Prepare buy/sell orders
-        orders = gdax_state['orders']
+        # Prepare order contexts
+        order_contexts = gdax_state['contexts']
         for tweet in tweets:
-            self._paper_trade(tweet, orders)
+            self._paper_trade(tweet, order_contexts)
             self._update_twitter_state(
                 tweet['user']['screen_name'],
                 tweet['id_str'])
 
-        # Act on orders
-        for order in orders.values():
-            self._update_gdax_state(order)
+        # Manage contexts
+        for ctxt in order_contexts.values():
+            self._update_gdax_state(ctxt)
             self._update_twitter_state(
-                order['handle'],
-                order['id'],
-                order['pair'],
-                order['side'])
+                ctxt['handle'],
+                ctxt['id'],
+                ctxt['pair'],
+                ctxt['side'])
 
             now = int(time.time())
 
-            if order['status'] in ('settled', 'expired'):
+            if ctxt['status'] in ('settled', 'expired'):
                 continue
 
-            if order['status'] == 'new' and now > order['expiration']:
-                log.warning("Order has expired. Ignoring: %s", order)
-                order['status'] = 'expired'
+            if ctxt['status'] == 'new' and now > ctxt['expiration']:
+                log.warning("Got new advice from an expired tweet. Ignoring... "
+                            "Tweet date: %s, order: %s",
+                            ctxt['tweet_date'], ctxt['order'])
+                ctxt['status'] = 'expired'
                 continue
 
-            if order['status'] == 'pending':
-                r = self.gdax.get_order(order['gdax_id'])
-                log.debug("Fetched order %s status: %s", order['gdax_id'], r)
+            order = ctxt['order']
+
+            if ctxt['status'] == 'pending':
+                r = self.gdax.get_order(ctxt['order_id'])
+                log.debug("Fetched order %s status: %s", ctxt['order_id'], r)
 
                 if r.get('status') in ('done', 'settled'):
-                    order['status'] = r.get('status')
-                    log.info("Order completed!: %s", order)
+                    ctxt['status'] = r.get('status')
+                    log.info("Order %s completed: %s", ctxt['order'], r)
                     self.available = get_balance(self.gdax, status_update=True)
                     continue
-                elif now < order['retry_expiration']:
-                    log.debug("Pending order is still valid: %s", order)
+                elif now < ctxt['retry_expiration']:
+                    log.debug("Pending order is still valid: %s", ctxt['order'])
                     continue
+                else:
+                    log.info("Pending order expired. Tries left: %d, details: %s",
+                             ctxt['tries_left'], order)
 
-            if order['tries_left'] > 0:
-                order['tries_left'] -= 1
-                order['retry_expiration'] = now + order['retry_ttl']
-                order = self._add_order(order)
-            elif (order['market_fallback'] and
-                  order['gdax_order']['type'] == 'limit'):
-                order['gdax_order']['type'] = 'market'
-                order['tries_left'] = 1
-                order['retry_expiration'] = now + order['retry_ttl']
+            if ctxt['tries_left'] > 0:
+                ctxt['tries_left'] -= 1
+                ctxt['retry_expiration'] = now + ctxt['retry_ttl']
+                self._place_order(ctxt)
+            elif ctxt['market_fallback'] and order['type'] == 'limit':
+                order['type'] = 'market'
+                ctxt['tries_left'] = 1
+                ctxt['retry_expiration'] = now + ctxt['retry_ttl']
             else:
-                log.warning("Order is expired: %s", order)
-                order['status'] = 'expired'
+                log.warning("Order context expired. No more retries: %s", ctxt)
+                ctxt['status'] = 'expired'
 
         self.state_obj.save()
 
-    def _order_waiting(self, order):
-        if order['status'] != 'pending':
-            return False
-
-        r = self.gdax.get_order(order['gdax_id'])
-        assert(r is not None)
-        if 'id' not in r:
-            return False
-
-        log.info("Found an order waiting: %s", r)
-        return r['status'] != 'settled'
-
-    def _update_gdax_state(self, new_order):
+    def _update_gdax_state(self, new_ctxt):
         state = self.state['gdax']
-        pair = new_order['pair']
+        pair = new_ctxt['pair']
         try:
-            order = state['orders'][pair]
+            ctxt = state['contexts'][pair]
         except KeyError:
-            state['orders'][pair] = new_order
+            state['contexts'][pair] = new_ctxt
         else:
-            if new_order['id'] > order['id']:
-                state['orders'][pair] = new_order
+            if new_ctxt['id'] > ctxt['id']:
+                state['contexts'][pair] = new_ctxt
 
     def _update_twitter_state(self, handle, new_id, pair=None, side=None):
         handle = handle.lower()
@@ -342,72 +346,104 @@ class TradingStateMachine:
             state['pairs'][pair]['id'] = new_id
             state['pairs'][pair]['side'] = side
 
-    def _get_orders(self, tweet, rule):
-        orders = []
-        for gdax_order in rule['orders']:
-            orders.append(new_order(rule, gdax_order, tweet))
-        return orders
+    def _get_order_contexts(self, tweet, rule):
+        contexts = []
+        for order in rule['orders']:
+            contexts.append(new_order_context(rule, order, tweet))
+        return contexts
 
-    def _add_order(self, order):
-        gdax_order = order['gdax_order']
-        # Ensure that there is no pending order for this pair.
-        if order['status'] == 'pending':
-            reply = self.gdax.cancel_order(order['gdax_id'])
+    def _check_funds(self, r, base_asset, order):
+        orig_order_size = order['size']
+        for i in range(5):
+            try:
+                funding_error = 'insufficient funds' in r['message'].lower()
+            except (TypeError, KeyError):
+                break
+            else:
+                if not funding_error:
+                    break
+
+            base_asset_amount = self.available[base_asset]
+            self.available = get_balance(self.gdax, status_update=True)
+            if base_asset_amount != self.available[base_asset]:
+                break
+
+            log.warning("Fallback: server replied we have insufficient funds. "
+                        "Current balance (%s) == previous balance (%s). "
+                        "Will try decreasing buy amount...",
+                        base_asset_amount, self.available[base_asset])
+            order['size'] = \
+                '%.8f' % (D(orig_order_size) * (D('0.999') - D(i) * D('0.002')))
+
+            log.info("Fallback: order: %s", order)
+            r = self.gdax.buy(**order)
+            log.info('Fallback: server reply: %s', r)
+            time.sleep(self.sleep_time)
+
+        log.debug("Fallback: exiting.")
+
+        return r
+
+    def _place_order(self, ctxt):
+        # Ensure that there is no pending order for this context.
+        if ctxt['status'] == 'pending':
+            reply = self.gdax.cancel_order(ctxt['order_id'])
             if reply is None or 'error' in reply:
-                log.error("Could not cancel order: %s", order['gdax_id'])
-                order['status'] = 'error'
-                return order
+                log.error("Could not cancel order: %s", ctxt['order_id'])
+                ctxt['status'] = 'error'
+                return ctxt
 
         self.available = get_balance(self.gdax, status_update=True)
-        order_book = self.public_client.get_product_order_book(order['pair'])
+        order_book = self.public_client.get_product_order_book(ctxt['pair'])
+        inside_bid = D(order_book['bids'][0][0])
+        inside_ask = D(order_book['asks'][0][0])
 
-        inside_bid = order_book['bids'][0][0]
-        inside_ask = order_book['asks'][0][0]
+        # Create a new order from the order template
+        order = deepcopy(ctxt['order'])
 
-        not_enough = False
-        for money in ['size', 'funds', 'price']:
-            try:
-                '''If the hundredths rounds down to zero,
-                ain't enough'''
-                gdax_order[money] = str(eval(
-                    gdax_order[money].format(
-                        tweet='tweet.text',
-                        available=self.available,
-                        inside_bid=inside_bid,
-                        inside_ask=inside_ask
-                    )
-                ))
-                not_enough = int(float(gdax_order[money]) * 100) == 0
+        spend_all_funds = 'max_buy_size' in order['size']
+        asset, base_asset = ctxt['pair'].split('-')
+        order['price'] = '%.2f' % eval(order['price'].format(
+            inside_bid=inside_bid,
+            inside_ask=inside_ask
+        ))
 
-            except KeyError:
-                pass
+        max_sell_size = self.available[asset]
+        max_buy_size = self.available[base_asset] / D(order['price'])
 
-        log.info('Placing order: %s' % prettify_dict(gdax_order))
-        if not_enough:
-            log.warning(
-                'One of {"price", "funds", "size"} is zero! '
-                'Order not placed.')
-            order['status'] = 'error'
-            return order
+        order['size'] = '%.8f' % eval(order['size'].format(
+            available=self.available,
+            max_buy_size=max_buy_size,
+            max_sell_size=max_sell_size,
+            inside_ask=inside_ask,
+            inside_bid=inside_bid
+        ))
+
+        if order['type'] == 'market' and 'price' in order:
+            del order['price']
+
+        log.info('Placing order: %s' % order)
 
         if order['side'] == 'buy':
-            r = self.gdax.buy(**gdax_order)
+            r = self.gdax.buy(**order)
+            if spend_all_funds:
+                r = self._check_funds(r, base_asset, order)
         else:
             assert order['side'] == 'sell'
-            r = self.gdax.sell(**gdax_order)
+            r = self.gdax.sell(**order)
 
         log.info('Order placed. Server reply: %s', r)
         time.sleep(self.sleep_time)
 
         if 'id' in r:
-            order['gdax_id'] = r['id']
-            order['status'] = r['status']
+            ctxt['order_id'] = r['id']
+            ctxt['status'] = r['status']
         else:
-            order['status'] = 'error'
+            ctxt['status'] = 'error'
 
-        return order
+        return ctxt
 
-    def _paper_trade(self, tweet, orders):
+    def _paper_trade(self, tweet, ctxts):
         log.debug("Got the following tweet: %s" % tweet['text'])
 
         for rule in self.rules:
@@ -418,32 +454,32 @@ class TradingStateMachine:
             log.info("Tweet rule match || @ %s: %s" %
                      (tweet['user']['screen_name'], tweet['text']))
 
-            new_orders = self._get_orders(tweet, rule)
-            for nwo in new_orders:
-                pair = nwo['pair']
-                order = orders.get(pair)
-                if order is None:
+            new_ctxts = self._get_order_contexts(tweet, rule)
+            for new_ctxt in new_ctxts:
+                pair = new_ctxt['pair']
+                ctxt = ctxts.get(pair)
+                if ctxt is None:
                     log.info("Adding order [%s] to pending orders list...",
-                             nwo['gdax_order'])
-                    orders[pair] = nwo
+                             new_ctxt['order'])
+                    ctxts[pair] = new_ctxt
                     continue
 
-                # The new order must be more recent than the existing one.
-                if int(nwo['id']) <= int(order['id']):
-                    log.warning("Order already up-to-date. (%s >= %s)",
-                                nwo['id'], order['id'])
+                # The new context must be more recent than the existing one.
+                if int(new_ctxt['id']) <= int(ctxt['id']):
+                    log.warning("Order context already up-to-date. (%s >= %s)",
+                                new_ctxt['id'], ctxt['id'])
                     continue
 
-                order_settled = order['status'] == 'settled'
-                if nwo['side'] == order['side'] and order_settled:
+                order_settled = ctxt['status'] == 'settled'
+                if new_ctxt['side'] == ctxt['side'] and order_settled:
                     log.warning(
-                        "New order side matches old order. "
+                        "New order position matches old order. "
                         "Updating state without further actions. "
                         "Details: Existing order: %s, new order: %s",
-                        order['gdax_order'], nwo['gdax_order'])
-                    order['id'] = new_order['id']
+                        ctxt['order'], new_ctxt['order'])
+                    ctxt['id'] = new_ctxt['id']
                 else:
-                    orders[pair] = nwo
+                    ctxts[pair] = new_ctxt
 
     def run(self):
         while True:
