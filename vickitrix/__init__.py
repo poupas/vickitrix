@@ -192,30 +192,39 @@ class State:
             json.dump(self.d, fp)
 
 
-def new_order_context(rule, order, tweet):
+def new_pair_context(rule, order, tweet):
     retries = int(rule.get('retries', 3))
     created = int(dateutil.parser.parse(tweet['created_at']).strftime('%s'))
     retry_ttl = int(rule.get('retry_ttl_s', 200))
     tweet_ttl = int(rule.get('tweet_ttl_s', 3600))
 
-    return {
+    pair = {
+        'pair': order['product_id'],
+
         'order': order,
         'order_id': None,
         'order_instance': None,
-        'pair': order['product_id'],
-        'side': order['side'],
 
         'handle': tweet['user']['screen_name'],
+        'tweet_date': tweet['created_at'],
         'id': tweet['id_str'],
+
+        'position': None,
+        'status': None,
         'tries_left': retries + 1,
         'market_fallback': rule.get('market_fallback', False),
-        'status': 'new',
         'retry_ttl': retry_ttl,
         'retry_expiration': 0,
-        'tweet_date': tweet['created_at'],
         'expiration': created + tweet_ttl,
     }
 
+    if int(time.time()) > pair['expiration']:
+        log.warning("Got new advice from an expired tweet. Ignoring... "
+                    "Tweet date: %s, order: %s",
+                    pair['tweet_date'], pair['order'])
+        pair['status'] = 'expired'
+
+    return pair
 
 class TradingStateMachine:
     """ Trades on GDAX based on tweets. """
@@ -259,32 +268,21 @@ class TradingStateMachine:
                 tweets += new_tweets
 
         # Prepare order contexts
-        order_contexts = gdax_state['contexts']
+        pair_contexts = gdax_state['contexts']
         for tweet in tweets:
-            self._paper_trade(tweet, order_contexts)
+            self._paper_trade(tweet, pair_contexts)
             self._update_twitter_state(
                 tweet['user']['screen_name'],
                 tweet['id_str'])
 
-        # Manage contexts
-        for ctxt in order_contexts.values():
+        # Issue orders for contexts
+        for ctxt in pair_contexts.values():
             self._update_gdax_state(ctxt)
-            self._update_twitter_state(
-                ctxt['handle'],
-                ctxt['id'],
-                ctxt['pair'],
-                ctxt['side'])
+            self._update_twitter_state(ctxt['handle'], ctxt['id'], ctxt['pair'])
 
             now = int(time.time())
 
             if ctxt['status'] in ('settled', 'expired'):
-                continue
-
-            if ctxt['status'] == 'new' and now > ctxt['expiration']:
-                log.warning("Got new advice from an expired tweet. Ignoring... "
-                            "Tweet date: %s, order: %s",
-                            ctxt['tweet_date'], ctxt['order'])
-                ctxt['status'] = 'expired'
                 continue
 
             if ctxt['status'] == 'pending':
@@ -292,7 +290,9 @@ class TradingStateMachine:
                 log.debug("Fetched order %s status: %s", ctxt['order_id'], r)
 
                 if r.get('status') in ('done', 'settled'):
-                    ctxt['status'] = r.get('status')
+                    ctxt['status'] = r['status']
+                    ctxt['position'] = \
+                        'long' if ctxt['order']['side'] == 'buy' else 'short'
                     log.info("Order %s done: %s", ctxt['order_id'], r)
                     self.available = get_balance(self.gdax, status_update=True)
                     continue
@@ -309,10 +309,10 @@ class TradingStateMachine:
                 ctxt['retry_expiration'] = now + ctxt['retry_ttl']
                 self._place_order(ctxt)
             elif ctxt['market_fallback'] and ctxt['order']['type'] == 'limit':
-                ctxt['order']['type'] = 'market'
-                ctxt['retry_expiration'] = now + ctxt['retry_ttl']
                 log.info("No more retries left, but market fallback is "
                          "enabled. Retrying one last time as market taker.")
+                ctxt['order']['type'] = 'market'
+                ctxt['retry_expiration'] = now + ctxt['retry_ttl']
                 self._place_order(ctxt)
             else:
                 log.warning("Order context expired. No more retries: %s", ctxt)
@@ -331,7 +331,7 @@ class TradingStateMachine:
             if new_ctxt['id'] > ctxt['id']:
                 state['contexts'][pair] = new_ctxt
 
-    def _update_twitter_state(self, handle, new_id, pair=None, side=None):
+    def _update_twitter_state(self, handle, new_id, pair=None):
         handle = handle.lower()
         state = self.state['twitter']
         try:
@@ -345,7 +345,6 @@ class TradingStateMachine:
                 }
             if pair and pair not in state['pairs']:
                 state['pairs'][pair] = {
-                    'side': side,
                     'id': new_id
                 }
             handle_id = state['handles'][handle]['id']
@@ -356,12 +355,11 @@ class TradingStateMachine:
             state['handles'][handle]['id'] = new_id
         if pair and int(new_id) > int(pair_id):
             state['pairs'][pair]['id'] = new_id
-            state['pairs'][pair]['side'] = side
 
-    def _get_order_contexts(self, tweet, rule):
+    def _get_pair_contexts(self, tweet, rule):
         contexts = []
         for order in rule['orders']:
-            contexts.append(new_order_context(rule, order, tweet))
+            contexts.append(new_pair_context(rule, order, tweet))
         return contexts
 
     def _check_funds(self, r, base_asset, order):
@@ -396,6 +394,59 @@ class TradingStateMachine:
 
         return r
 
+    def _calc_buy_size(self, ctxt, asset, base_asset, ask, bid, price):
+        order = ctxt['order']
+
+        short_pairs = []
+        for c in self.state['gdax']['contexts'].values():
+            if c['position'] == 'long':
+                continue
+
+            if c['position'] == 'short':
+                short_pairs.append(c['pair'])
+                continue
+
+            # No position (short or long) yet. (i.e., no order has completed).
+            buying = c['order']['side'] == 'buy'
+            selling = c['order']['side'] == 'sell'
+
+            if c['status'] == 'expired':
+                # The twitter bot went short.
+                if selling: short_pairs.append(c['pair'])
+                # The twitter bot went long.
+                if buying: pass
+
+            # The order has not expired. So we are still changing our state.
+            else:
+                # Buying. Ensure we get our share of the available balance.
+                if buying: short_pairs.append(c['pair'])
+                # Selling.
+                if selling: pass
+
+        log.debug("The following pairs are short: %s", short_pairs)
+        n_short_pairs = len(short_pairs)
+        if order['size'] == '{split_balance}':
+            size = self.available[base_asset] / D(n_short_pairs) / D(price)
+        else:
+            base_asset_balance = self.available[base_asset]
+            max_balance = base_asset_balance / D(price)
+            size = eval(order['size'].format(
+                inside_ask=ask,
+                inside_bid=bid,
+                available=self.available,
+                max_balance=max_balance
+            ))
+        return '%.8f' % size
+
+    def _calc_sell_size(self, ctxt, ask, bid):
+        order = ctxt['order']
+        size = eval(order['size'].format(
+                inside_ask=ask,
+                inside_bid=bid,
+                available=self.available
+            ))
+        return '%.8f' % size
+
     def _place_order(self, ctxt):
         # Ensure that there is no pending order for this context.
         if ctxt['status'] == 'pending':
@@ -405,7 +456,6 @@ class TradingStateMachine:
                 ctxt['status'] = 'error'
                 return ctxt
 
-        self.available = get_balance(self.gdax, status_update=True)
         order_book = self.public_client.get_product_order_book(ctxt['pair'])
         inside_bid = D(order_book['bids'][0][0])
         inside_ask = D(order_book['asks'][0][0])
@@ -413,36 +463,42 @@ class TradingStateMachine:
         # Create a new order from the order template
         order = deepcopy(ctxt['order'])
         ctxt['order_instance'] = order
-
-        spend_all_funds = 'max_buy_size' in order['size']
-        asset, base_asset = ctxt['pair'].split('-')
         order['price'] = '%.2f' % eval(order['price'].format(
             inside_bid=inside_bid,
             inside_ask=inside_ask
         ))
+        price = order['price']
+        # Refresh balance
+        self.available = get_balance(self.gdax, status_update=True)
 
-        max_sell_size = self.available[asset]
-        max_buy_size = self.available[base_asset] / D(order['price'])
-
-        order['size'] = '%.8f' % eval(order['size'].format(
-            available=self.available,
-            max_buy_size=max_buy_size,
-            max_sell_size=max_sell_size,
-            inside_ask=inside_ask,
-            inside_bid=inside_bid
-        ))
+        spend_all_funds = '{max_balance}' in order['size']
+        asset, base_asset = ctxt['pair'].split('-')
 
         if order['type'] == 'market' and 'price' in order:
             del order['price']
 
-        log.info('Placing order: %s' % order)
-
         if order['side'] == 'buy':
+            order['size'] = self._calc_buy_size(
+                ctxt, asset, base_asset, inside_ask, inside_bid, price)
+            log.info('Placing order: %s' % order)
+            import pdb;
+            pdb.set_trace()
             r = self.gdax.buy(**order)
             if spend_all_funds:
                 r = self._check_funds(r, base_asset, order)
         else:
             assert order['side'] == 'sell'
+            if self.available[asset] == 0:
+                log.debug("Trying to go short with no available funds. "
+                          "Finish order: %s", order)
+                ctxt['status'] = 'settled'
+                ctxt['position'] = 'short'
+                return ctxt
+
+            order['size'] = self._calc_sell_size(ctxt, inside_ask, inside_bid)
+            log.info('Placing order: %s' % order)
+            import pdb;
+            pdb.set_trace()
             r = self.gdax.sell(**order)
 
         log.info('Order placed. Server reply: %s', r)
@@ -467,16 +523,16 @@ class TradingStateMachine:
             log.info("Tweet rule match || @ %s: %s" %
                      (tweet['user']['screen_name'], tweet['text']))
 
-            new_ctxts = self._get_order_contexts(tweet, rule)
+            new_ctxts = self._get_pair_contexts(tweet, rule)
             for new_ctxt in new_ctxts:
                 pair = new_ctxt['pair']
                 ctxt = ctxts.get(pair)
                 if ctxt is None:
-                    log.info("Adding potential order [%s] to pending orders "
-                             "list... Note that this tweet has not yet been "
+                    log.info("Potentially updating pair context [%s] based on "
+                             "tweet %s... Note that this tweet has not yet been "
                              "validated (e.g., it may have expired). "
                              "Validation will occur shortly...",
-                             new_ctxt['order'])
+                             tweet['id_str'], new_ctxt['order'])
                     ctxts[pair] = new_ctxt
                     continue
 
@@ -487,10 +543,10 @@ class TradingStateMachine:
                                 new_ctxt['id'], ctxt['id'])
                     continue
 
-                order_settled = ctxt['status'] == 'settled'
-                if new_ctxt['side'] == ctxt['side'] and order_settled:
+                is_settled = ctxt['status'] == 'settled'
+                if new_ctxt['side'] == ctxt['side'] and is_settled:
                     log.warning(
-                        "New order position matches old order. "
+                        "New pair context matches existing context. "
                         "Updating state without further actions. "
                         "Details: Existing order: %s, new order: %s",
                         ctxt['order'], new_ctxt['order'])
