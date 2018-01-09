@@ -201,6 +201,7 @@ def new_order_context(rule, order, tweet):
     return {
         'order': order,
         'order_id': None,
+        'order_instance': None,
         'pair': order['product_id'],
         'side': order['side'],
 
@@ -244,8 +245,18 @@ class TradingStateMachine:
             except KeyError:
                 latest_tweet = None
 
-            tweets += self.twitter.get_user_timeline(
-                user_id=uid, exclude_replies=True, since_id=latest_tweet)
+            log.debug("Fetching all tweets for handle %s (latest tweet id %s)",
+                      handle, latest_tweet)
+
+            while True:
+                new_tweets = self.twitter.get_user_timeline(
+                    user_id=uid, exclude_replies=True, since_id=latest_tweet,
+                    count=100)
+                time.sleep(0.5)
+                if not new_tweets:
+                    break
+                latest_tweet = new_tweets[0]['id_str']
+                tweets += new_tweets
 
         # Prepare order contexts
         order_contexts = gdax_state['contexts']
@@ -276,30 +287,29 @@ class TradingStateMachine:
                 ctxt['status'] = 'expired'
                 continue
 
-            order = ctxt['order']
-
             if ctxt['status'] == 'pending':
                 r = self.gdax.get_order(ctxt['order_id'])
                 log.debug("Fetched order %s status: %s", ctxt['order_id'], r)
 
                 if r.get('status') in ('done', 'settled'):
                     ctxt['status'] = r.get('status')
-                    log.info("Order %s completed: %s", ctxt['order'], r)
+                    log.info("Order %s done: %s", ctxt['order_id'], r)
                     self.available = get_balance(self.gdax, status_update=True)
                     continue
                 elif now < ctxt['retry_expiration']:
-                    log.debug("Pending order is still valid: %s", ctxt['order'])
+                    log.debug("Pending order %s has not yet expired: %s",
+                              ctxt['order_id'], ctxt['order_instance'])
                     continue
                 else:
                     log.info("Pending order expired. Tries left: %d, details: %s",
-                             ctxt['tries_left'], order)
+                             ctxt['tries_left'], ctxt['order_instance'])
 
             if ctxt['tries_left'] > 0:
                 ctxt['tries_left'] -= 1
                 ctxt['retry_expiration'] = now + ctxt['retry_ttl']
                 self._place_order(ctxt)
-            elif ctxt['market_fallback'] and order['type'] == 'limit':
-                order['type'] = 'market'
+            elif ctxt['market_fallback'] and ctxt['order']['type'] == 'limit':
+                ctxt['order']['type'] = 'market'
                 ctxt['tries_left'] = 1
                 ctxt['retry_expiration'] = now + ctxt['retry_ttl']
             else:
@@ -368,7 +378,7 @@ class TradingStateMachine:
             if base_asset_amount != self.available[base_asset]:
                 break
 
-            log.warning("Fallback: server replied we have insufficient funds. "
+            log.warning("Fallback: server said we have insufficient funds. "
                         "Current balance (%s) == previous balance (%s). "
                         "Will try decreasing buy amount...",
                         base_asset_amount, self.available[base_asset])
@@ -380,7 +390,7 @@ class TradingStateMachine:
             log.info('Fallback: server reply: %s', r)
             time.sleep(self.sleep_time)
 
-        log.debug("Fallback: exiting.")
+        log.debug("Fallback: done.")
 
         return r
 
@@ -400,6 +410,7 @@ class TradingStateMachine:
 
         # Create a new order from the order template
         order = deepcopy(ctxt['order'])
+        ctxt['order_instance'] = order
 
         spend_all_funds = 'max_buy_size' in order['size']
         asset, base_asset = ctxt['pair'].split('-')
@@ -459,14 +470,18 @@ class TradingStateMachine:
                 pair = new_ctxt['pair']
                 ctxt = ctxts.get(pair)
                 if ctxt is None:
-                    log.info("Adding order [%s] to pending orders list...",
+                    log.info("Adding potential order [%s] to pending orders "
+                             "list... Note that this order has not yet been "
+                             "validated (e.g., it may have expired). "
+                             "Validation will occur shortly...",
                              new_ctxt['order'])
                     ctxts[pair] = new_ctxt
                     continue
 
                 # The new context must be more recent than the existing one.
                 if int(new_ctxt['id']) <= int(ctxt['id']):
-                    log.warning("Order context already up-to-date. (%s >= %s)",
+                    log.warning("Ignoring tweet with equal or older id "
+                                "(our tweet: %s new tweet: >= %s)",
                                 new_ctxt['id'], ctxt['id'])
                     continue
 
