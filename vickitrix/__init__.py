@@ -481,8 +481,6 @@ class TradingStateMachine:
             order['size'] = self._calc_buy_size(
                 ctxt, asset, base_asset, inside_ask, inside_bid, price)
             log.info('Placing order: %s' % order)
-            import pdb;
-            pdb.set_trace()
             r = self.gdax.buy(**order)
             if spend_all_funds:
                 r = self._check_funds(r, base_asset, order)
@@ -497,8 +495,6 @@ class TradingStateMachine:
 
             order['size'] = self._calc_sell_size(ctxt, inside_ask, inside_bid)
             log.info('Placing order: %s' % order)
-            import pdb;
-            pdb.set_trace()
             r = self.gdax.sell(**order)
 
         log.info('Order placed. Server reply: %s', r)
