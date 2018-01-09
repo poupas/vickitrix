@@ -310,8 +310,10 @@ class TradingStateMachine:
                 self._place_order(ctxt)
             elif ctxt['market_fallback'] and ctxt['order']['type'] == 'limit':
                 ctxt['order']['type'] = 'market'
-                ctxt['tries_left'] = 1
                 ctxt['retry_expiration'] = now + ctxt['retry_ttl']
+                log.info("No more retries left, but market fallback is "
+                         "enabled. Retrying one last time as market taker.")
+                self._place_order(ctxt)
             else:
                 log.warning("Order context expired. No more retries: %s", ctxt)
                 ctxt['status'] = 'expired'
@@ -471,7 +473,7 @@ class TradingStateMachine:
                 ctxt = ctxts.get(pair)
                 if ctxt is None:
                     log.info("Adding potential order [%s] to pending orders "
-                             "list... Note that this order has not yet been "
+                             "list... Note that this tweet has not yet been "
                              "validated (e.g., it may have expired). "
                              "Validation will occur shortly...",
                              new_ctxt['order'])
