@@ -551,8 +551,13 @@ class TradingStateMachine:
                     ctxts[pair] = new_ctxt
 
     def run(self):
+        next_status_ts = 0
         while True:
+            now = time.time()
             self._run()
+            if now > next_status_ts:
+                self.available = get_balance(self.gdax, status_update=True)
+                next_status_ts = now + 3600
             time.sleep(120)
 
 
