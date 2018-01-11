@@ -471,7 +471,6 @@ class TradingStateMachine:
         # Refresh balance
         self.available = get_balance(self.gdax, status_update=True)
 
-        spend_all_funds = '{max_balance}' in order['size']
         asset, base_asset = ctxt['pair'].split('-')
 
         if order['type'] == 'market' and 'price' in order:
@@ -482,8 +481,7 @@ class TradingStateMachine:
                 ctxt, asset, base_asset, inside_ask, inside_bid, price)
             log.info('Placing order: %s' % order)
             r = self.gdax.buy(**order)
-            if spend_all_funds:
-                r = self._check_funds(r, base_asset, order)
+            r = self._check_funds(r, base_asset, order)
         else:
             assert order['side'] == 'sell'
             if self.available[asset] == 0:
