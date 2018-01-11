@@ -540,7 +540,7 @@ class TradingStateMachine:
                     continue
 
                 is_settled = ctxt['status'] == 'settled'
-                if new_ctxt['side'] == ctxt['side'] and is_settled:
+                if new_ctxt['order']['side'] == ctxt['order']['side'] and is_settled:
                     log.warning(
                         "New pair context matches existing context. "
                         "Updating state without further actions. "
