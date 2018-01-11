@@ -399,10 +399,15 @@ class TradingStateMachine:
 
         short_pairs = []
         for c in self.state['gdax']['contexts'].values():
+            # Only makes sense for pairs with the same base asset
+            # E.g., *-EUR, *-BTC
+            if not c['pair'].endswith('-%s' % base_asset):
+                continue
             if c['position'] == 'long':
                 continue
-
-            if c['position'] == 'short':
+            # TODO: check if this is right. It depends on wether GDAX updates
+            # the balance as orders are being placed or not
+            if c['position'] == 'short':  # and c['status'] == 'settled' ?
                 short_pairs.append(c['pair'])
                 continue
 
